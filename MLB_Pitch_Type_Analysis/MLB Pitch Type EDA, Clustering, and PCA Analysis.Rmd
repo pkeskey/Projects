@@ -1,0 +1,798 @@
+---
+title: "STAT 4051 Final Project"
+author: "Preston Keskey - Student ID: 5762754"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## Data Merging
+
+```{r}
+# 1) Read 2015–18 & 2019 CSVs
+# 2) Build players$full_name
+# 3) Merge datasets
+# 4) Explicit type coercion
+# 5) Bind rows
+# 6) Median-impute cont_vars by pitch_type
+# 7) Global median fallback for remaining cont_vars
+# 8) Recompute zone & nasty where NA
+# 9) Inspect final missingness
+# 10) Export final CSV
+
+library(dplyr)
+library(tidyr)
+
+# 1) Read raw CSVs
+pitches      <- read.csv("pitches.csv",       stringsAsFactors = FALSE)
+atbats       <- read.csv("atbats.csv",        stringsAsFactors = FALSE)
+games        <- read.csv("games.csv",         stringsAsFactors = FALSE)
+players      <- read.csv("player_names.csv",  stringsAsFactors = FALSE)
+pitches_2019 <- read.csv("2019_pitches.csv",  stringsAsFactors = FALSE)
+atbats_2019  <- read.csv("2019_atbats.csv",   stringsAsFactors = FALSE)
+games_2019   <- read.csv("2019_games.csv",    stringsAsFactors = FALSE)
+
+# 2) Build players$full_name
+players <- players %>%
+  mutate(full_name = paste(first_name, last_name)) %>%
+  select(-first_name, -last_name)
+
+# 3a) Merge 2015–2018, drop type_confidence if present
+all_data <- pitches %>%
+  left_join(atbats, by = "ab_id") %>%
+  left_join(games,  by = "g_id") %>%
+  left_join(players, by = c("pitcher_id" = "id")) %>%
+    rename(pitcher_name = full_name) %>%
+  left_join(players, by = c("batter_id"  = "id")) %>%
+    rename(batter_name  = full_name) %>%
+  { if("type_confidence" %in% names(.)) select(., -type_confidence) else . }
+
+# 3b) Merge 2019, drop type_confidence
+all_2019_data <- pitches_2019 %>%
+  left_join(atbats_2019, by = "ab_id") %>%
+  left_join(games_2019,     by = "g_id") %>%
+  left_join(players,        by = c("pitcher_id" = "id")) %>%
+    rename(pitcher_name = full_name) %>%
+  left_join(players,        by = c("batter_id"  = "id")) %>%
+    rename(batter_name  = full_name) %>%
+  select(-type_confidence)
+
+# 4) Explicit type coercion
+coerce_types <- function(df) {
+  df %>% mutate(
+    px               = as.numeric(px),
+    pz               = as.numeric(pz),
+    x                = as.numeric(x),
+    y                = as.numeric(y),
+    spin_rate        = as.numeric(spin_rate),
+    spin_dir         = as.numeric(spin_dir),
+    break_angle      = as.numeric(break_angle),
+    break_length     = as.numeric(break_length),
+    break_y          = as.numeric(break_y),
+    ax               = as.numeric(ax),
+    ay               = as.numeric(ay),
+    az               = as.numeric(az),
+    vx0              = as.numeric(vx0),
+    vy0              = as.numeric(vy0),
+    vz0              = as.numeric(vz0),
+    x0               = as.numeric(x0),
+    y0               = as.numeric(y0),
+    z0               = as.numeric(z0),
+    pfx_x            = as.numeric(pfx_x),
+    pfx_z            = as.numeric(pfx_z),
+    start_speed      = as.numeric(start_speed),
+    end_speed        = as.numeric(end_speed),
+    sz_bot           = as.numeric(sz_bot),
+    sz_top           = as.numeric(sz_top),
+    nasty            = as.integer(nasty),
+    zone             = as.integer(zone),
+    g_id             = as.integer(g_id),
+    inning           = as.integer(inning),
+    p_score          = as.integer(p_score),
+    away_final_score = as.integer(away_final_score),
+    home_final_score = as.integer(home_final_score),
+    attendance       = as.integer(attendance),
+    elapsed_time     = as.integer(elapsed_time),
+    top              = as.character(top),
+    start_time       = as.character(start_time),
+    umpire_1B        = as.character(umpire_1B),
+    umpire_2B        = as.character(umpire_2B),
+    umpire_3B        = as.character(umpire_3B),
+    umpire_HP        = as.character(umpire_HP),
+    weather          = as.character(weather),
+    wind             = as.character(wind),
+    across(where(is.factor), as.character)
+  )
+}
+all_data      <- coerce_types(all_data)
+all_2019_data <- coerce_types(all_2019_data)
+
+# 5) Bind rows
+all_data_combined <- bind_rows(all_data, all_2019_data)
+
+# 6) Median-impute continuous vars by pitch_type
+cont_vars <- c(
+  "px","pz","x","y","spin_rate","spin_dir",
+  "break_angle","break_length","break_y",
+  "ax","ay","az","vx0","vy0","vz0",
+  "x0","y0","z0","pfx_x","pfx_z",
+  "start_speed","end_speed","sz_bot","sz_top"
+)
+all_data_combined <- all_data_combined %>%
+  group_by(pitch_type) %>%
+  mutate(across(all_of(cont_vars),
+                ~ if_else(is.na(.x), median(.x, na.rm = TRUE), .x))) %>%
+  ungroup()
+
+# 7) Global median fallback for remaining cont_vars
+global_meds <- all_data_combined %>%
+  summarise(across(all_of(cont_vars), ~ median(.x, na.rm=TRUE)))
+all_data_combined <- all_data_combined %>%
+  replace_na(as.list(global_meds))
+
+# 8) Recompute zone where NA (after px/pz are filled)
+all_data_combined <- all_data_combined %>%
+  mutate(
+    zone = if_else(
+      is.na(zone),
+      as.integer(cut(px, breaks = c(-Inf, -1, -0.5, 0.5, 1, Inf))),
+      zone
+    )
+  )
+
+# 9) Recompute nasty where NA (after spin_rate is filled)
+all_data_combined <- all_data_combined %>%
+  group_by(pitch_type) %>%
+  mutate(
+    nasty = if_else(
+      is.na(nasty),
+      as.integer(spin_rate > median(spin_rate, na.rm = TRUE)),
+      nasty
+    )
+  ) %>%
+  ungroup()
+
+# 10) Final missingness check & export
+missing_summary2 <- all_data_combined %>%
+  summarise(across(all_of(c(cont_vars, "zone", "nasty")), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to="variable", values_to="n_missing") %>%
+  arrange(desc(n_missing))
+cat("Final missingness after fallback & recompute:\n")
+print(missing_summary2)
+
+# 11) Export final CSV
+write.csv(all_data_combined, "all_data_combined_imputed.csv", row.names = FALSE)
+```
+
+#### Missing Data Inspection (Right now only from 2019 dataset)
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+# 2) Compute missing‐value counts per column
+missing_summary <- all_data_combined %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(
+    cols      = everything(),
+    names_to  = "variable",
+    values_to = "n_missing"
+  ) %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(n_missing))
+
+# 3) Print it
+print(missing_summary, n=100)
+```
+
+# EDA
+
+#### Load Data
+
+```{r}
+all_data_combined <- read.csv(
+  "all_data_combined_imputed.csv",
+  stringsAsFactors = FALSE
+)
+```
+
+#### Pitcher Tendencies
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(viridis)
+library(gridExtra)
+library(scales)
+library(stringr)
+
+# 0) Define full names for pitch_type codes ---------------------------------
+pitch_type_map <- c(
+  CH = "Changeup",
+  CU = "Curveball",
+  EP = "Eephus*",
+  FC = "Cutter",
+  FF = "Four-seam Fastball",
+  FO = "Pitchout (also PO)*",
+  FS = "Splitter",
+  FT = "Two-seam Fastball",
+  IN = "Intentional Ball",
+  KC = "Knuckle Curve",
+  KN = "Knuckeball",
+  PO = "Pitchout (also FO)*",
+  SC = "Screwball*",
+  SI = "Sinker",
+  SL = "Slider",
+  UN = "Unknown*"
+)
+
+# 1) Data prep & full sampling ---------------------------------------------
+df_clean <- all_data_combined %>%
+  mutate(
+    # map blank/NA codes to "Unknown"
+    pitch_type = if_else(
+      is.na(pitch_type) | str_trim(pitch_type) == "",
+      "UN", pitch_type
+    ),
+    # recode to full names, leave any codes not in map as-is
+    pitch_type = recode(pitch_type, !!!pitch_type_map),
+    base_state = factor(
+      paste0(
+        ifelse(on_1b == 1, "1", "0"),
+        ifelse(on_2b == 1, "1", "0"),
+        ifelse(on_3b == 1, "1", "0")
+      ),
+      levels = c("000","100","010","110","001","101","011","111"),
+      labels = c("Empty","1B","2B","1B+2B","3B","1B+3B","2B+3B","Loaded")
+    ),
+    is_fastball = if_else(
+      # fastball family codes
+      pitch_type %in% c(
+        "Four-seam Fastball","Sinker","Two-seam Fastball",
+        "Cutter","Splitter","Fastball"  # in case "FB" appears
+      ),
+      "Fastball", "Other"
+    )
+  )
+
+eda_samp <- df_clean %>% sample_frac(1.00)
+
+# 2) Collapse to top-8 pitch types (others → "Other") -----------------------
+top8 <- eda_samp %>%
+  count(pitch_type, sort = TRUE) %>%
+  slice(1:8) %>%
+  pull(pitch_type)
+
+eda_samp <- eda_samp %>%
+  mutate(
+    pt8 = if_else(pitch_type %in% top8, pitch_type, "Other"),
+    pt8 = factor(pt8, levels = c(top8, "Other"))
+  )
+
+# 3) Plot A: overall counts -------------------------------------------------
+pA <- eda_samp %>%
+  count(pt8) %>%
+  ggplot(aes(reorder(pt8, n), n, fill = pt8)) +
+    geom_col() +
+    coord_flip() +
+    scale_fill_viridis_d(option = "plasma", name = "Pitch Type") +
+    scale_y_continuous(labels = comma) +
+    labs(
+      title = "Overall Top-8 Pitch Types + Other",
+      x     = "Pitch Type",
+      y     = "Count"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(legend.position = "none")
+print(pA)
+
+# 4) Helper for heatmap dataframes ------------------------------------------
+make_heatmap_df <- function(df, var, filter_levels = NULL) {
+  tmp <- df
+  if (!is.null(filter_levels)) {
+    tmp <- tmp %>% filter(!!sym(var) %in% filter_levels)
+  }
+  tmp %>%
+    count(!!sym(var), pt8) %>%
+    group_by(!!sym(var)) %>%
+    mutate(prop = n / sum(n)) %>%
+    ungroup() %>%
+    rename(group = !!sym(var)) %>%
+    mutate(txt_color = if_else(prop > 0.5, "white", "black"))
+}
+
+# 5) Plot B: by Ball Count (0–3) --------------------------------------------
+dfB <- make_heatmap_df(eda_samp, "b_count", filter_levels = 0:3)
+pB <- ggplot(dfB, aes(x = factor(group), y = pt8, fill = prop)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = percent(prop, accuracy = 1), color = txt_color),
+            size = 3) +
+  scale_color_identity() +
+  scale_fill_gradient(
+    low  = "white", high = "#2C3E50",
+    labels = percent_format(accuracy = 1),
+    name   = "Proportion"
+  ) +
+  labs(
+    title = "Pitch-Type Proportion by Ball Count (0–3)",
+    x     = "Balls",
+    y     = "Pitch Type"
+  ) +
+  theme_minimal(base_size = 14)
+print(pB)
+
+# 6) Plot C: by Strike Count (0–2) ------------------------------------------
+dfC <- make_heatmap_df(eda_samp, "s_count", filter_levels = 0:2)
+pC <- ggplot(dfC, aes(x = factor(group), y = pt8, fill = prop)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = percent(prop, accuracy = 1), color = txt_color),
+            size = 3) +
+  scale_color_identity() +
+  scale_fill_gradient(
+    low  = "white", high = "#2C3E50",
+    labels = percent_format(accuracy = 1),
+    name   = "Proportion"
+  ) +
+  labs(
+    title = "Pitch-Type Proportion by Strike Count (0–2)",
+    x     = "Strikes",
+    y     = "Pitch Type"
+  ) +
+  theme_minimal(base_size = 14)
+print(pC)
+
+# 7) Plot D: by Base Occupancy ---------------------------------------------
+dfD <- make_heatmap_df(eda_samp, "base_state")
+pD <- ggplot(dfD, aes(x = group, y = pt8, fill = prop)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = percent(prop, accuracy = 1), color = txt_color),
+            size = 3) +
+  scale_color_identity() +
+  scale_fill_gradient(
+    low  = "white", high = "#2C3E50",
+    labels = percent_format(accuracy = 1),
+    name   = "Proportion"
+  ) +
+  labs(
+    title = "Pitch-Type Proportion by Base Occupancy",
+    x     = "Base State",
+    y     = "Pitch Type"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(pD)
+
+# 8) Plot E: handedness stacked ------------------------------------------------
+pE <- eda_samp %>%
+  filter(!is.na(p_throws), !is.na(stand)) %>%
+  ggplot(aes(x = pt8, fill = stand)) +
+    geom_bar(position = "fill") +
+    facet_wrap(~ p_throws,
+               labeller = labeller(p_throws = c(L = "L-hander", R = "R-hander"))) +
+    coord_flip() +
+    scale_fill_viridis_d(option = "cividis", name = "Batter Stance") +
+    labs(
+      title = "Pitch-Type Proportion by Pitcher Hand & Batter Stance",
+      x     = "Pitch Type",
+      y     = "Proportion"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(legend.position = "bottom")
+print(pE)
+
+# 9) Plot F: Fastball % by Count --------------------------------------------
+dfF <- eda_samp %>%
+  filter(b_count %in% 0:3, s_count %in% 0:2) %>%
+  group_by(b_count, s_count) %>%
+  summarise(
+    fb_pct    = mean(is_fastball == "Fastball"),
+    txt_color = if_else(fb_pct > 0.5, "black", "white"),
+    .groups   = "drop"
+  )
+
+pF <- ggplot(dfF, aes(x = factor(b_count), y = factor(s_count), fill = fb_pct)) +
+  geom_tile(color = "grey80") +
+  geom_text(aes(label = percent(fb_pct, accuracy = 1), color = txt_color),
+            size = 3) +
+  scale_color_identity() +
+  scale_fill_distiller(
+    palette   = "Blues",
+    direction = 1,
+    name      = "Fastball %",
+    labels    = percent_format(accuracy = 1)
+  ) +
+  labs(
+    title = "Fastball % by Ball–Strike Count (0–3, 0–2)",
+    x     = "Balls",
+    y     = "Strikes"
+  ) +
+  theme_minimal(base_size = 14)
+print(pF)
+
+# 10) Plot G: Fastball % by Inning ------------------------------------------
+dfG <- eda_samp %>%
+  filter(inning >= 1, inning <= 9) %>%
+  group_by(inning) %>%
+  summarise(
+    fb_pct = mean(is_fastball == "Fastball"),
+    .groups = "drop"
+  )
+
+pG <- ggplot(dfG, aes(x = factor(inning), y = fb_pct)) +
+  geom_col(fill = "#1B9E77") +
+  geom_text(aes(label = percent(fb_pct, accuracy = 1)),
+            vjust = -0.3, size = 3) +
+  scale_y_continuous(
+    labels   = percent_format(accuracy = 1),
+    limits   = c(0, 1),
+    expand   = expansion(mult = c(0, 0.1))
+  ) +
+  labs(
+    title = "Fastball % by Inning (1–9)",
+    x     = "Inning",
+    y     = "Fastball %"
+  ) +
+  theme_minimal(base_size = 14)
+print(pG)
+```
+
+#### Pitch Types with Strike Zone
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(viridis)
+library(stringr)
+
+# Prep & pick Scherzer’s top‐6 pitch types -----------------------------------
+pitch_map <- c(
+  FF = "Four-seam\nFastball", FT = "Two-seam\nFastball", FC = "Cutter",
+  SL = "Slider", CH = "Changeup", CU = "Curveball",
+  FS = "Splitter", SI = "Sinker", KC = "Knuckle\nCurve", KN = "Knuckeball"
+)
+
+df0 <- all_data_combined %>%
+  filter(
+    pitcher_name == "Max Scherzer",
+    pitch_type  %in% names(pitch_map),
+    !is.na(px), !is.na(pz),
+    !is.na(start_speed),
+    !is.na(event),
+    stand %in% c("R","L")
+  ) %>%
+  mutate(
+    px_adj      = if_else(stand=="L", -px, px),
+    start_speed = as.numeric(start_speed),
+    pitch_type  = factor(pitch_type, levels=names(pitch_map), labels=pitch_map),
+    event_type  = case_when(
+      str_detect(event, regex("single|double|triple|home run", ignore_case=TRUE)) ~ "Hit",
+      str_detect(event, regex("walk",                             ignore_case=TRUE)) ~ "Walk",
+      str_detect(event, regex("hit by pitch",                     ignore_case=TRUE)) ~ "HBP",
+      event == "Strikeout"                                                           ~ "Strikeout",
+      TRUE                                                                           ~ NA_character_
+    ) %>% factor(levels=c("Hit","Walk","HBP","Strikeout"))
+  ) %>%
+  filter(!is.na(event_type)) %>%
+  droplevels()
+
+top6 <- df0 %>% count(pitch_type, sort=TRUE) %>% slice_head(n=6) %>% pull(pitch_type)
+df   <- df0 %>% filter(pitch_type %in% top6)
+
+zone_rect <- tibble(
+  xmin = -8.5/12, xmax =  8.5/12,
+  ymin =  1.5,      ymax =  3.5
+)
+
+# Outcome plot with 50% ellipse outline --------------------------------------
+p_outcome_ellipse <- ggplot(df, aes(px_adj, pz)) +
+  # 50% normal‐approx ellipse for cluster
+  stat_ellipse(
+    aes(group = pitch_type),
+    level = 0.5,
+    type  = "norm",
+    color = "black",
+    size  = 0.8
+  ) +
+  annotate("rect",
+           xmin=zone_rect$xmin, xmax=zone_rect$xmax,
+           ymin=zone_rect$ymin, ymax=zone_rect$ymax,
+           color="black", size=1, fill=NA) +
+  geom_point(aes(color=event_type),
+             size=0.6, alpha=0.4) +
+  facet_wrap(~ pitch_type, ncol=3, labeller=label_wrap_gen(15)) +
+  coord_fixed(xlim=c(-1.2,1.2), ylim=c(0.5,5), ratio=1) +
+  scale_color_manual(
+    name   = "At‐Bat Result",
+    values = c("Hit"="#1b9e77","Walk"="#d95f02","HBP"="#7570b3","Strikeout"="#e7298a")
+  ) +
+  labs(
+    title = "Max Scherzer — Pitch Outcomes by Location (50% Cluster)",
+    x     = "Horizontal Position (ft)",
+    y     = "Vertical Position (ft)"
+  ) +
+  theme_minimal(base_size=13) +
+  theme(
+    strip.background = element_rect(fill="grey90", color=NA),
+    strip.text       = element_text(face="bold", size=10),
+    legend.position  = "right"
+  )
+
+print(p_outcome_ellipse)
+
+
+# Speed plot with 50% ellipse outline ----------------------------------------
+p_speed_ellipse <- ggplot(df, aes(px_adj, pz)) +
+  stat_ellipse(
+    aes(group = pitch_type),
+    level = 0.5,
+    type  = "norm",
+    color = "black",
+    size  = 0.8
+  ) +
+  annotate("rect",
+           xmin=zone_rect$xmin, xmax=zone_rect$xmax,
+           ymin=zone_rect$ymin, ymax=zone_rect$ymax,
+           color="black", size=1, fill=NA) +
+  geom_point(aes(color=start_speed),
+             size=0.6, alpha=0.5) +
+  facet_wrap(~ pitch_type, ncol=3, labeller=label_wrap_gen(15)) +
+  coord_fixed(xlim=c(-1.2,1.2), ylim=c(0.5,5), ratio=1) +
+  scale_color_viridis_c(
+    name   = "Release Speed (mph)",
+    labels = scales::number_format(accuracy=0.1),
+    option = "C"
+  ) +
+  labs(
+    title = "Max Scherzer — Release Speed by Location (50% Cluster)",
+    x     = "Horizontal Position (ft)",
+    y     = "Vertical Position (ft)"
+  ) +
+  theme_minimal(base_size=13) +
+  theme(
+    strip.background = element_rect(fill="grey90", color=NA),
+    strip.text       = element_text(face="bold", size=10),
+    legend.position  = "bottom"
+  )
+
+print(p_speed_ellipse)
+```
+
+#### Distributions by Pitch Type
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(knitr)
+
+# Labels
+pitch_labels <- c(
+  CH = "Changeup", CU = "Curveball", EP = "Eephus*", FC = "Cutter",
+  FF = "Four-seam Fastball", FO = "Pitchout (also PO)*", FS = "Splitter",
+  FT = "Two-seam Fastball", IN = "Intentional Ball", KC = "Knuckle Curve",
+  KN = "Knuckeball", PO = "Pitchout (also FO)*", SC = "Screwball*",
+  SI = "Sinker", SL = "Slider", UN = "Unknown*"
+)
+
+#—— 0. clean
+df <- all_data_combined %>%
+  filter(!is.na(pitch_type), nzchar(pitch_type))
+
+#—— 1. top 10 pitch codes
+top10 <- df %>%
+  count(pitch_type, sort = TRUE) %>%
+  slice_head(n = 10) %>%
+  pull(pitch_type)
+
+#—— 2. restrict & factor so ggplot only sees those 10, in order
+df10 <- df %>%
+  filter(pitch_type %in% top10) %>%
+  mutate(pitch_type = factor(pitch_type, levels = top10))
+
+#—— 3. density plot with a clean, discrete palette
+ggplot(df10, aes(x = start_speed, color = pitch_type, fill = pitch_type)) +
+  geom_density(adjust = 2, alpha = 0.3, size = 1) +
+  scale_color_brewer(
+    palette = "Set3",
+    name   = "Pitch Type",
+    labels = pitch_labels[top10]
+  ) +
+  scale_fill_brewer(
+    palette = "Set3",
+    name   = "Pitch Type",
+    labels = pitch_labels[top10]
+  ) +
+  labs(
+    title = "Smoothed Density of Start Speed for Top 10 Pitch Types",
+    x     = "Start Speed (mph)",
+    y     = "Density"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+)
+```
+
+```{r}
+library(dplyr)
+library(knitr)
+
+# 1. Identify your top 3 pitch types overall
+top3 <- all_data_combined %>%
+  filter(!is.na(pitch_type), nzchar(pitch_type)) %>%
+  count(pitch_type, sort = TRUE) %>%
+  slice_head(n = 3) %>%
+  pull(pitch_type)
+
+# 2. Build the “next_pitch” sequence
+seq_df <- all_data_combined %>%
+  filter(!is.na(pitch_type), nzchar(pitch_type)) %>%
+  arrange(g_id, ab_id, pitch_num) %>%
+  group_by(g_id, ab_id) %>%
+  mutate(next_pitch = lead(pitch_type)) %>%
+  ungroup()
+
+# 3. For each of those top 3, tally what follows and pick the top 3
+table_df <- seq_df %>%
+  filter(pitch_type %in% top3, !is.na(next_pitch)) %>%
+  group_by(pitch_type, next_pitch) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  group_by(pitch_type) %>%
+  slice_max(Count, n = 3) %>%
+  ungroup()
+
+pitch_labels <- c(
+  CH = "Changeup", CU = "Curveball", EP = "Eephus*", FC = "Cutter",
+  FF = "Four-seam Fastball", FO = "Pitchout (also PO)*", FS = "Splitter",
+  FT = "Two-seam Fastball", IN = "Intentional Ball", KC = "Knuckle Curve",
+  KN = "Knuckeball", PO = "Pitchout (also FO)*", SC = "Screwball*",
+  SI = "Sinker", SL = "Slider", UN = "Unknown*"
+)
+
+table_df <- table_df %>%
+  mutate(
+    `Original Pitch` = pitch_labels[pitch_type],
+    `Next Pitch`     = pitch_labels[next_pitch]
+  ) %>%
+  select(`Original Pitch`, `Next Pitch`, Count)
+
+# 5. Print and render
+print(table_df)
+kable(
+  table_df,
+  caption = "Top 3 Most Common Next Pitches After Each of the Top 3 Pitch Types"
+)
+```
+
+# PCA
+
+```{r}
+# =============================================================================
+# R Script: PCA Biplot with Full Pitch Type Labels
+# =============================================================================
+
+# 0. Load required packages
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggfortify)    # for autoplot()
+
+# -----------------------------------------------------------------------------
+# 1. Define continuous pitch-tracking variables for PCA
+# -----------------------------------------------------------------------------
+pca_vars <- c(
+  "px", "pz",
+  "start_speed", "end_speed",
+  "spin_rate", "spin_dir",
+  "break_angle", "break_length", "break_y",
+  "ax", "ay", "az",
+  "sz_bot", "sz_top",
+  "vx0", "vy0", "vz0",
+  "x", "x0", "y", "y0", "z0",
+  "pfx_x", "pfx_z",
+  "nasty"
+)
+
+# -----------------------------------------------------------------------------
+# 2. Subset the data (no NAs/Infs already in this data)
+# -----------------------------------------------------------------------------
+pca_data <- all_data_combined %>%
+  select(all_of(pca_vars))
+
+# 1. Compute the correlation matrix of your selected continuous features
+cor_mat <- cor(pca_data, use = "pairwise.complete.obs")
+
+# 2. Visualize with corrplot
+library(corrplot)
+corrplot(
+  cor_mat,
+  method      = "color",    # colored squares
+  type        = "upper",    # show only upper triangle
+  order       = "hclust",   # cluster variables
+  tl.cex      = 0.7,        # label font size
+  addCoef.col = "grey20",   # add correlation coefficients
+  number.cex  = 0.5,        # coefficient font size
+  title       = "Correlation Matrix of Pitch‐Tracking Variables",
+  mar         = c(0,0,1,0)  # space for title
+)
+
+# -----------------------------------------------------------------------------
+# 3. Plot distributions with μ & σ² annotations
+# -----------------------------------------------------------------------------
+dist_df <- pca_data %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value")
+stats_df <- dist_df %>%
+  group_by(variable) %>%
+  summarize(mean = mean(value), var = var(value), .groups = "drop")
+
+ggplot(dist_df, aes(x = value)) +
+  geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
+  geom_vline(data = stats_df, aes(xintercept = mean),
+             color = "red", linetype = "dashed") +
+  geom_text(data = stats_df,
+            aes(x = mean, y = Inf,
+                label = paste0("μ=", round(mean,1),
+                               "\nσ²=", round(var,1))),
+            vjust = 2, hjust = 0, size = 2.5) +
+  facet_wrap(~ variable, scales = "free") +
+  labs(
+    title = "Distributions of Continuous Features\n(red dashed = mean; text = μ & σ²)",
+    x     = NULL,
+    y     = "Count"
+  ) +
+  theme_minimal()
+
+# -----------------------------------------------------------------------------
+# 4. Perform PCA on centered & scaled data
+# -----------------------------------------------------------------------------
+pca_res <- prcomp(pca_data, center = TRUE, scale. = TRUE)
+
+# -----------------------------------------------------------------------------
+# 5. Define full‐name mapping for pitch_type
+# -----------------------------------------------------------------------------
+pitch_labels <- c(
+  CH = "Changeup",
+  CU = "Curveball",
+  EP = "Eephus*",
+  FC = "Cutter",
+  FF = "Four-seam Fastball",
+  FO = "Pitchout (also PO)*",
+  FS = "Splitter",
+  FT = "Two-seam Fastball",
+  IN = "Intentional ball",
+  KC = "Knuckle curve",
+  KN = "Knuckeball",
+  PO = "Pitchout (also FO)*",
+  SC = "Screwball*",
+  SI = "Sinker",
+  SL = "Slider",
+  UN = "Unknown*"
+)
+
+# -----------------------------------------------------------------------------
+# 6. Prepare data for biplot: add full labels to original dataset
+# -----------------------------------------------------------------------------
+plot_df <- all_data_combined %>%
+  mutate(
+    pitch_full = recode(pitch_type, !!!pitch_labels),
+    pitch_full = factor(pitch_full, levels = unique(pitch_labels))
+  )
+
+# -----------------------------------------------------------------------------
+# 7. Biplot colored by full pitch type names
+# -----------------------------------------------------------------------------
+autoplot(
+  pca_res,
+  data       = plot_df,
+  colour     = "pitch_full",
+  loadings   = TRUE,
+  loadings.label       = TRUE,
+  loadings.label.size  = 3
+) +
+  scale_colour_discrete(name = "Pitch Type Definitions") +
+  labs(
+    title = "PCA Biplot (PC1 vs PC2) Colored by Pitch Type"
+  ) +
+  theme_minimal()
+
+# SAVE SCORES for later
+pc_scores <- as.data.frame(pca_res$x)
+```
